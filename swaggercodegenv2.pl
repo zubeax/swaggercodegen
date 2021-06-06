@@ -8,9 +8,14 @@
 # Description   for all api's from the swagger file(s) listed on the command line :              #
 #                                                                                                #
 #               - generate model, controller and service classes                                 #
-#               - generate sample client instantiation code                                      #
+#               - generate model class instantiation code                                        #
+#               - resolve references to local and remote external files                          #
+#               - print a structured report of endpoints from input file                         #
+#               - print data types parsed from input file                                        #
 #                                                                                                #
-# Target Environments : Spring Boot 2.4                                                          #
+# Supported Open API version : 3.0                                                               #
+#                                                                                                #
+# Target Environment         : Spring Boot 2.4                                                   #
 #                                                                                                #
 # Exit code                                                                                      #
 #        0 : Successful                                                                          #
@@ -19,9 +24,17 @@
 #                                                                                                #
 # ---------------------------------------------------------------------------------------------- #
 #                                                                                                #
-#   Prerequisite perl packages :                                                                 #
+# Prerequisite perl packages :                                                                   #
 #                                                                                                #
-#   rf. to the 'used packages' section below                                                     #
+# Cwd                        HTTP::Date                                                          #
+# Digest::MD5                HTTP::Request                                                       #
+# Encode                     HTTP::Response                                                      #
+# Encode::Locale             JSON::PP                                                            #
+# File::Basename             LWP::MediaTypes                                                     #
+# File::Path                 LWP::UserAgent                                                      #
+# File::RelDir               Storable                                                            #
+# File::Spec                 URI                                                                 #
+# Getopt::Std                YAML::XS                                                            #
 #                                                                                                #
 # ---------------------------------------------------------------------------------------------- #
 #                                                                                                #
@@ -30,6 +43,7 @@
 # Ver   Date        Name        Description                                                      #
 #                                                                                                #
 # 1.0   08.03.2018  A. Zuber    initial version                                                  #
+# 2.0   01.06.2021  A. Zuber    implement Open API 3.0                                           #
 #                                                                                                #
 # ---------------------------------------------------------------------------------------------- #
 
@@ -54,8 +68,8 @@ use Getopt::Std;
 
 BEGIN
 {
-        $scriptName = basename($0);
-        $scriptDir  = dirname($0);
+    $scriptName = basename($0);
+    $scriptDir  = dirname($0);
 }
 
 # ------------------------------------------------------------------------------------ #
@@ -65,14 +79,14 @@ BEGIN
 use constant swagger_version => 3.0;
 
 my $inbuilttypes = {
-      'string'         => 'String'
-    , 'number'         => 'BigDecimal'
-    , 'integer'        => 'BigInteger'
-    , 'boolean'        => 'Boolean'
-    , 'file'           => 'String'
-    , 'object'         => 'Object'
-    , 'void'           => 'Void'
-    , 'null'           => 'Void'
+      'string'  => 'String'
+    , 'number'  => 'BigDecimal'
+    , 'integer' => 'BigInteger'
+    , 'boolean' => 'Boolean'
+    , 'file'    => 'String'
+    , 'object'  => 'Object'
+    , 'void'    => 'Void'
+    , 'null'    => 'Void'
 };
 
 my $readInput = {
@@ -130,8 +144,16 @@ package FileInterface;
 
 use Digest::MD5 qw(md5_base64);
 use Encode qw(encode_utf8);
+use Encode::Locale;
 use File::Path qw(make_path);
+use File::Spec;
+use HTTP::Date		();
+use HTTP::Request;
+use HTTP::Response;
 use JSON::PP;
+use LWP::UserAgent	();
+use LWP::MediaTypes qw(guess_media_type media_suffix);
+use URI				();
 use YAML::XS;
 
 sub readFile
@@ -337,71 +359,17 @@ sub writeModelClass
     }
 }
 
-########################################################################
 ##
-#   Dump the 'definitions' from the inputhash
+#   readLocalFile:
+#
+#   read a file from a local file system.
+#
+#   Constraints :
+#
+#   - reject absolute paths
+#   - reject relative paths that navigate out of the swagger directory
 ##
-########################################################################
-
-package SwaggerUtils;
-
-use Cwd qw(realpath);
-use File::Basename;
-use File::RelDir;
-
-##
-#   resolve a local reference to the input hash table
-##
-sub resolveLocalReference
-{
-    my ($plist) = @_;
-
-    my $datatype = $inputhash;
-
-    for my $p (@$plist)
-    {
-        if (!exists $datatype->{$p})
-        {
-            die "$p from schema \$ref not found in \$inputhash";
-        }
-        $datatype = $datatype->{$p};
-    }
-
-    # the loop doesn't retain the last array element in the control variable,
-    # so we have to explicitly pop the datatype name.
-
-    ##
-    #   CAVEAT: we enforce class names to begin with an uppercase letter
-    ##
-
-    my $name = pop @$plist;
-    $name    = ucfirst Parser::formatCamelCase($name, "[^A-Za-z0-9]+");
-
-    if (ref $datatype ne 'HASH')
-    {
-        my $filename = 'swagger file';
-        $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
-
-        die "[$filename] $name : datatype is not a hash table";
-    }
-
-    my $result  = { name => $name, type => $datatype };
-
-    ##
-    #   tag the lookup result from the input hash if we already have a symbol table entry
-    ##
-    $result->{isSymbolDefined} = 'true' if exists $symboltable->{$result->{name}};
-
-    return $result;
-}
-
-##
-#   resolve a reference to a definition from an external file.
-#   merge the external file into the input hash.
-#   return a schema reference if the there is only one definition
-#   in the file, else undef.
-##
-sub mergeExternalFile
+sub readLocalFile
 {
     my ( $filename ) = @_;
 
@@ -427,7 +395,7 @@ sub mergeExternalFile
     die "inputformat undefined"                 if !defined $inputformat;
     die "unsupported inputformat $inputformat"  if !exists $readInput->{$inputformat};
 
-    my $externalhash = $readInput->{$inputformat}->($filename);
+    my $externalhash        = $readInput->{$inputformat}->($filename);
 
     my $abs_filename        = realpath($filename);
     my $temp                = File::RelDir->New(realpath($basepath));
@@ -439,41 +407,243 @@ sub mergeExternalFile
         $mergedfiles->{$relative_filename} = '1';
     }
 
+    return $externalhash;
+}
+
+##
+#   downloadFile:
+#
+#   download a external reference from the remote url.
+#   convert the response content to a perl hash table and return that to the caller.
+##
+sub downloadFile
+{
+    my ( $remoteUrl, $opt ) = @_;
+
+    my $url         = URI->new( decode( locale => $remoteUrl ) );
+
+    # configure a UserAgent object
+
+    my $ua = LWP::UserAgent->new(
+        agent      => "swaggercodegen/1.0",
+        keep_alive => 1,
+        env_proxy  => 1,
+    );
+
+    my $user        = $opt->{u}                                 if exists $opt->{u};
+    my $pass        = $opt->{p}                                 if exists $opt->{p};
+
+    $ua->credentials( $remoteUrl, "some realm", $user, $pass )  if defined $user && defined $pass;
+    $ua->proxy( ['HTTP', 'HTTPS', 'FTP'], $opt->{x} )           if exists $opt->{x};
+    $ENV{'http_proxy'}	= $opt->{x}					            if exists $opt->{x};
+    $ENV{'https_proxy'}	= $opt->{x}					            if exists $opt->{x};
+
+    my $response;
+    my $req;
+
+    # inquire the size of the file to download
+
+    $req = HTTP::Request->new( HEAD => $url );
+    $req->authorization_basic($user, $pass)		                if defined $user && defined $pass;
+    $response = $ua->request( $req ) ;
+
+    if (!$response->is_success)
+    {
+        die "retrieving information for URL=$url failed with HTTP error:". $response->status_line . "\n";
+    }
+
+    my $length	= $response->content_length;
+    if ($length > 16*1024*1024)
+    {
+        die "length $length of download file exceeds 16MB limit";
+    }
+
+    # download the file
+
+    $req = HTTP::Request->new( GET => $url );
+    $req->authorization_basic($user, $pass)		                if defined $user && defined $pass;
+
+    $response = $ua->request( $req );
+
+    if (!$response->is_success)
+    {
+        die "download  failed: ".$response->status_line."\n";
+    }
+
+    if ( $response->header("X-Died"))
+    {
+        if ( my $died = $response->header("X-Died") )
+        {
+            print "$died\n";
+        }
+    }
+
+    my $file_text    = $response->content();
+    my $content_type = $response->header('content-type');
+
+    my $inputformat;
+    if (defined $content_type)
+    {
+        $inputformat = 'json' if $content_type =~ /json/i;
+        $inputformat = 'yaml' if $content_type =~ /yaml/i;
+    }
+
+    $inputformat  = FileInterface::findFormat($remoteUrl) if !defined $inputformat;
+    my $output;
+
+    SWITCH:
+    {
+        ($inputformat =~ /json/i) && do {
+            eval {$output = decode_json(utf8::is_utf8($file_text) ? encode_utf8($file_text) : $file_text)};
+
+            if (my $error = $@)
+            {
+                die "invalid json : $error";
+            }
+            last SWITCH;
+        };
+        ($inputformat =~ /yaml/i) && do {
+            eval {$output = Load(utf8::is_utf8($file_text) ? encode_utf8($file_text) : $file_text)};
+
+            if (my $error = $@)
+            {
+                die "invalid yaml : $error";
+            }
+            last SWITCH;
+        };
+        do {
+            die "unsupported input format $inputformat";
+        };
+    }
+
+    return $output;
+}
+
+########################################################################
+##
+#   Dump the 'definitions' from the inputhash
+##
+########################################################################
+
+package SwaggerUtils;
+
+use Cwd qw(realpath);
+use File::Basename;
+use File::RelDir;
+
+##
+#   resolve a local reference to the input hash table
+##
+sub resolveLocalReference
+{
+    my ($ref) = @_;
+
+    my @plist = split '[/]', $ref;
+
+    my $datatype = $inputhash;
+
+    for my $p (@plist)
+    {
+        die "$p from schema \$ref not found in \$inputhash" if !exists $datatype->{$p};
+        $datatype = $datatype->{$p};
+    }
+
+    # the loop doesn't retain the last array element in the control variable,
+    # so we have to explicitly pop the datatype name.
+
     ##
-    #   CAVEAT: we copy ALL definitions from the external file to the input hash,
+    #   CAVEAT: we enforce class names to begin with an uppercase letter
+    ##
+
+    my $name = pop @plist;
+    $name    = ucfirst Parser::formatCamelCase($name, "[^A-Za-z0-9]+");
+
+    if (ref $datatype ne 'HASH')
+    {
+        my $filename = 'swagger file';
+        $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
+
+        die "[$filename] $name : datatype is not a hash table";
+    }
+
+    my $result  = { name => $name, type => $datatype };
+
+    ##
+    #   tag the lookup result from the input hash if we already have a symbol table entry
+    ##
+    $result->{isSymbolDefined} = 'true' if exists $symboltable->{$result->{name}};
+
+    return $result;
+}
+
+##
+#   resolve a reference to a definition from an external file.
+#   merge the external file into the input hash.
+#   return a schema reference if the there is exactly one definition
+#   in the file, else undef.
+##
+sub mergeExternalFile
+{
+    my ( $filename ) = @_;
+
+    my $externalhash;
+
+    if ( $filename =~ /^http[s]*:\/\/.*$/ )
+    {
+        $externalhash = FileInterface::downloadFile($filename);
+    }
+    else
+    {
+        $externalhash = FileInterface::readLocalFile($filename);
+    }
+
+    ##
+    #   CAVEAT: copy ALL definitions from the external file to the input hash,
     #           so that we can have nested definitions as well.
     #
     #   Tag all copied definitions with the filename of origin.
     ##
 
-    my @sectionlist     = grep /definitions|components|links|parameters/, keys %$externalhash;
+    my $sectionnames    = qw/definitions|components|links|parameters/;
+
+    my @sectionlist     = grep /$sectionnames/, keys %$externalhash;
     my $extref          = undef;
     my $definitionCount = 0;
 
     if (scalar @sectionlist == 0)
     {
         ##
-        #   if the external definitions come without a section, they go to 'definitions' by default
+        #   pick the directory name containing the file as the default section
+        #   if it is one of the defined section names.
+        ##
+        my @filenamecomponents = split '/', $filename;
+        pop @filenamecomponents;
+        my $defaultsection     = pop @filenamecomponents;
+        $defaultsection        = 'definitions' if $defaultsection !~ /$sectionnames/;
+
+        ##
+        #   if the external definitions come without a section, they go to the $defaultsection
         ##
         my $alreadydefined = 0;
         for my $key (keys %$externalhash)
         {
-            $alreadydefined = 1 if exists $inputhash->{definitions}{$key}{filename};
+            $alreadydefined = 1 if exists $inputhash->{$defaultsection}{$key}{filename};
 
             if ( !$alreadydefined )
             {
                 $externalhash->{$key}{filename} = $filename;
-                $inputhash->{definitions}{$key} = $externalhash->{$key};
+                $inputhash->{$defaultsection}{$key} = $externalhash->{$key};
             }
             else
             {
-                if ( exists $inputhash->{definitions}{$key}{filename} )
+                if ( exists $inputhash->{$defaultsection}{$key}{filename} )
                 {
-                    my $previousFilename = $inputhash->{definitions}{$key}{filename};
+                    my $previousFilename = $inputhash->{$defaultsection}{$key}{filename};
                     die "external reference $key resolves to 2 different files : $previousFilename - $filename" if $previousFilename ne $filename;
                 }
             }
-            $extref = "/definitions/${key}";
+
+            $extref = "/$defaultsection/${key}";
             ++$definitionCount;
         }
     }
@@ -499,6 +669,7 @@ sub mergeExternalFile
                         die sprintf "external reference %s resolves to 2 different files : %s - %s", $key, $previousFilename, $filename if $previousFilename ne $filename;
                     }
                 }
+
                 $extref = "/${section}/$key";
                 ++$definitionCount;
             }
@@ -507,6 +678,9 @@ sub mergeExternalFile
         }
     }
 
+    ##
+    #   return 'undef' if there is more than one definition in the file
+    ##
     $extref = undef if $definitionCount > 1;
 
     return $extref;
@@ -518,6 +692,9 @@ sub mergeExternalFile
 #   resolve a reference to a composite data type
 #   to an inputhash entry or a reference to a
 #   primitive datatype.
+#
+#   import definitions from an external file, if the
+#   reference is to a local or remote file.
 ##
 sub resolveDataTypeReference
 {
@@ -532,8 +709,7 @@ sub resolveDataTypeReference
 
     my $result;
 
-    # split the reference path into components,
-    # then navigate the swagger hash table.
+    # split the reference path into components, then navigate the swagger hash table.
     # abort if we don't find the referred entry.
 
     my $ref = $schema->{'$ref'};
@@ -546,9 +722,8 @@ sub resolveDataTypeReference
         ##
         ( $ref =~ /^#/ ) && do
         {
-            $ref =~ s/^#\///;
-            my @plist = split '[/]', $ref;
-            $result = resolveLocalReference(\@plist);
+            $ref    =~ s/^#\///;
+            $result = resolveLocalReference($ref);
             last SWITCH;
         };
         ##
@@ -578,14 +753,16 @@ sub resolveDataTypeReference
 
             $extref =~ s/^\///;
 
-            my @plist = split '[/]', $extref;
-            $result = resolveLocalReference( \@plist );
+            ##
+            #   resolve the reference locally after importing the definitions from the external file
+            ##
+            $result = resolveLocalReference( $extref );
 
             last SWITCH;
         };
         do
         {
-            die "unsupported '\$ref' flavour";
+            die "unsupported '\$ref' flavour : $ref";
         }
     }
 
@@ -867,6 +1044,11 @@ sub dumpDefinition
 {
     my ($level, $entryname, $entry, $options) = @_;
 
+    # if ( $entryname eq 'ContainerConfig')
+    # {
+    #     printf "found!\n";
+    # }
+
     my $indent    = ' ' x (4 * $level);
 
     die "\$options must be a hash" if ref $options ne 'HASH';
@@ -1146,14 +1328,11 @@ sub dumpDefinitionsTable
 
         my $components = $inputhash->{components};
 
-        for my $section ('schemas', 'links')
+        for my $section (sort keys %$components)
         {
-            my $subsection = $components->{$section} if exists $components->{$section};
-            next if !defined $subsection;
-
-            for my $entryname (sort keys %$subsection)
+            for my $entryname (sort keys %$section)
             {
-                my $entry = $subsection->{$entryname};
+                my $entry = $section->{$entryname};
                 dumpDefinition(0, $entryname, $entry, { definition => $entryname, type => uc substr($section, 0, 1) });
                 printf "%s\n", '-' x 132;
             }
@@ -1175,7 +1354,6 @@ sub dumpDefinitionsTable
             printf "%s\n", '-' x 132;
         }
     }
-
 }
 
 ########################################################################
@@ -1228,7 +1406,6 @@ sub dumpEndPointParameters
             };
             do {
                 die "$param->{name} : unsupported parameter type $param->{in}";
-                last SWITCH;
             };
         }
     }
@@ -1413,7 +1590,7 @@ sub dumpSwaggerfile
 
 ########################################################################
 ##
-#   Dump the symbol table
+#   Manage the symbol table
 ##
 ########################################################################
 
@@ -1432,6 +1609,11 @@ sub dumpSymboltableEntry
 
     die "$entryname is not a defined symbol" if !exists $symboltable->{$entryname};
     $entry      = $symboltable->{$entryname};
+
+    # if ($entryname eq 'ContainerSummaryNetworkSettings')
+    # {
+    #     printf "found!\n";
+    # }
 
     my $type    = "";
     my $subtype = "";
@@ -1500,12 +1682,37 @@ sub dumpSymboltableEntry
 
             last SWITCH;
         };
+        (exists $entry->{isMap}) && do
+        {
+            my $hashValType = $entry->{hashValType};
+            my $modifier = 'M   ';
+            $modifier    = 'MA  ' if exists $hashValType->{type} && $hashValType->{type} eq 'array';
+
+            my $typename   = deriveMapTypeDeclaration($entry, {});
+
+            my $required = "optional ";
+            $required    = $entry->{required} if exists $entry->{required};
+
+            printf "%-4s %-60s [%-9s] %-24s : %s\n"
+                , $modifier
+                , $typename
+                , $required
+                , "[map]"
+                , " ";
+
+            last SWITCH;
+        };
         (exists $entry->{attriblist}) && do
         {
             for my $p (@{$entry->{attriblist}})
             {
-                my $modifier = ' ' x 4;
-                $modifier    = 'A   ' if exists $p->{type} && $p->{type} eq 'array';
+                my $modifier = '';
+                $modifier   .= 'A' if exists $p->{type} && $p->{type} eq 'array';
+                $modifier   .= 'M' if exists $p->{isMap};
+                $modifier   .= 'D' if exists $p->{isDummy} || exists $p->{isDummyClass};
+
+                $modifier    = substr($modifier.(' 'x 4), 0, 4);
+
                 my $typename = SymbolTable::resolveSymbolAttribTypeName($p);
 
                 my $name     = "<undefined>";
@@ -1531,15 +1738,6 @@ sub dumpSymboltableEntry
             die "unsupport symbol type $entryname";
         }
     }
-
-    # if (exists $entry->{classimports} && scalar keys %{$entry->{classimports}} > 0)
-    # {
-    #     printf "class imports:\n";
-    #     for my $ci (sort keys %{$entry->{classimports}})
-    #     {
-    #         printf "%s\n", $ci;
-    #     }
-    # }
 }
 
 ##
@@ -1573,7 +1771,7 @@ sub dumpSymboltable
 ##
 ########################################################################
 
-sub createSymbolTableEntry
+sub createSymboltableEntry
 {
     my ($entry) = @_;
 
@@ -1589,7 +1787,7 @@ sub createSymbolTableEntry
 
     my $name = $entry->{name};
 
-    # if ($name eq "DbPaymentTransactionInformation")
+    # if ($name eq "IPAM")
     # {
     #     printf "found!\n";
     # }
@@ -1608,7 +1806,7 @@ sub createSymbolTableEntry
     if (exists $symboltable->{$name} && $symboltable->{$name}{status} ne 'open')
     {
         my $sref = $symboltable->{$name};
-        return createSymbolTableReference($name) if exists $sref->{status} && $sref->{status} eq 'closed';
+        return createSymboltableReference($name) if exists $sref->{status} && $sref->{status} eq 'closed';
     }
 
     ##
@@ -1629,8 +1827,7 @@ sub createSymbolTableEntry
     return $sref;
 }
 
-
-sub createSymbolTableReference
+sub createSymboltableReference
 {
     my ($entryname) = @_;
 
@@ -1644,7 +1841,7 @@ sub createSymbolTableReference
     return $result;
 }
 
-sub resolveSymbolReference
+sub resolveSymboltableReference
 {
     my ($reference) = @_;
 
@@ -1658,7 +1855,8 @@ sub resolveSymbolReference
 ##
 #   resolveDatatypeName :
 #
-#   resolve a type reference to a type name
+#   resolve a type reference to a name of a symbol table entry
+#   return 'undef' if no such entry exists
 ##
 sub resolveDatatypeName
 {
@@ -1672,6 +1870,12 @@ sub resolveDatatypeName
     my $name;
     SWITCH:
     {
+        (exists $symbol->{isMap}) && do
+        {
+            #die sprintf "%s : can't resolve a map to a symbol table entry", $symbol->{name};
+            $name = undef;
+            last SWITCH;
+        };
         (exists $symbol->{definition}) && do
         {
             die "can't resolve definition in $symbol->{name}"    if !exists $symbol->{definition}{type};
@@ -1713,13 +1917,75 @@ sub resolveDatatypeName
         };
         do
         {
-            die "can't resolve type $symbol->{name}";
+            $name = "<undefined>";
+            $name   = $symbol->{name} if exists $symbol->{name};
+            die "can't resolve type $name";
         };
     }
 
     return $name;
 }
 
+##
+#   deriveMapTypeDeclaration :
+#
+#   generate a map type declaration from key and value types
+##
+sub deriveMapTypeDeclaration
+{
+    my ($mapType, $classimports, $options ) = @_;
+
+    my $keyType = $mapType->{hashKeyType};
+    die "unsupported key type $keyType" if !exists $inbuilttypes->{$keyType};
+    $keyType = $inbuilttypes->{$keyType};
+
+    my $valType;
+
+    my $temp = $mapType->{hashValType};
+
+    SWITCH: {
+        (exists $temp->{definition}) && do {
+            $temp = $temp->{definition};
+            die "hash value definition is missing 'type'" if !exists $temp->{type};
+            $temp = $temp->{type};
+            die "unsupported val type $temp" if !exists $inbuilttypes->{$temp};
+            $valType = $inbuilttypes->{$temp};
+            last SWITCH;
+        };
+        (exists $temp->{reference}) && do {
+            $valType = $temp->{reference};
+            $classimports->{$valType} = 1 if defined $classimports && ref $classimports eq 'HASH';
+            last SWITCH;
+        };
+        do {
+            die "unsupported Hash Value Type";
+        };
+    }
+
+    my $idmap   = 'Map';
+    my $idlist  = 'List';
+
+    if ( defined $options && ref $options eq 'HASH' && exists $options->{usejava})
+    {
+        $idmap   = 'HashMap';
+        $idlist  = 'ArrayList';
+    }
+
+    $temp = $mapType->{hashValType};
+    if (exists $temp->{type} && $temp->{type} eq 'array')
+    {
+        $valType = "${idlist}<${valType}>";
+    }
+
+    return "${idmap}<${keyType},${valType}>";
+}
+
+
+##
+#   resolveSymbolAttribTypeName :
+#
+#   extract the attribute type
+##
 sub resolveSymbolAttribTypeName
 {
     my ($symbolattribute) = @_;
@@ -1738,12 +2004,15 @@ sub resolveSymbolAttribTypeName
             $typename = $symbolattribute->{reference};
             last SWITCH;
         };
-        # (exists $symbolattribute->{attriblist}) && do {
-        #     $typename = "struct";
-        #     last SWITCH;
-        # };
+        (exists $symbolattribute->{isMap}) && do
+        {
+            $typename = deriveMapTypeDeclaration($symbolattribute, {'usejava'=>'true'});
+            last SWITCH;
+        };
         do {
-            die "can resolve symbol attribute type";
+            my $name = $symbolattribute->{name} if exists $symbolattribute->{name};
+            $name = "<undefined>" if !defined $name;
+            die "can't resolve symbol attribute type of attribute $name";
         }
     }
 
@@ -1757,7 +2026,7 @@ sub resolveTypeAlias
 {
     my ($attr) = @_;
 
-    die "attribute must be a hash reference" if ref $attr ne 'HASH';
+    die "INTERNAL: attribute must be a hash reference" if ref $attr ne 'HASH';
 
     my $isArray = 0;
     $isArray    = 1 if exists $attr->{type} && $attr->{type} eq 'array';
@@ -1803,9 +2072,9 @@ sub findMismatches
 
     for my $p (@{$oldtype->{attriblist}})
     {
-        my $name = $p->{name};
-        my $type = SymbolTable::resolveSymbolAttribTypeName($p);
-        my $required = exists $p->{required} ? $p->{required} : "optional";
+        my $name            = $p->{name};
+        my $type            = SymbolTable::resolveSymbolAttribTypeName($p);
+        my $required        = exists $p->{required} ? $p->{required} : "optional";
         $typetable->{$name} = { typename => $type, required => $required };
     }
 
@@ -1866,6 +2135,24 @@ sub array2ConcatenatedStrings
 
     die "\$list is not an array" if ref($list) ne 'ARRAY';
 
+    return undef if scalar @$list == 0;
+
+    my $additionalentry = $options->{additionalentry} if defined $options && ref $options eq 'HASH' && exists $options->{additionalentry};
+
+    my $temp  = $list;
+    if (defined $additionalentry)
+    {
+        $temp     = [];
+        my $found = 0;
+        for my $item (@$list)
+        {
+            push @$temp, $item;
+            $found = 1 if $item =~ $additionalentry;
+        }
+
+        push @$temp, $additionalentry if !$found;
+    }
+
     my $liststring = "";
     my $delim      = "";
 
@@ -1876,7 +2163,7 @@ sub array2ConcatenatedStrings
     {
         $liststring .= "${delim}${apostrophe}$_${apostrophe}";
         $delim = ", ";
-    } @$list;
+    } @$temp;
 
     return $liststring
 }
@@ -1910,7 +2197,7 @@ sub extractPolymorphType
 
     return undef if ref $type ne 'HASH';
 
-    my $result = [];
+    my $result      = [];
     my $isPolymorph = 0;
 
     map {
@@ -1999,11 +2286,7 @@ sub addImportedClass
     if (exists $symboltable->{$datatype})
     {
         my $sref = $symboltable->{$datatype};
-
-        if (exists $sref->{isAlias})
-        {
-            return $classimports;
-        }
+        return $classimports if exists $sref->{isAlias};
     }
 
     if (exists $inbuilttypes->{$datatype})
@@ -2011,38 +2294,11 @@ sub addImportedClass
         return $classimports;
     }
 
+    die "INTERNAL: can't import a non-existing symbol" if !exists $symboltable->{$datatype};
+
     $classimports->{$datatype} = 1;
 
     return $classimports;
-}
-
-##
-#   paramToString :
-#
-#   resolve a type reference to a string.
-##
-sub deriveParamType
-{
-    my ($symboltableref) = @_;
-
-    my $type;
-    my $result = {};
-
-    SWITCH:
-    {
-        (defined $symboltableref) && do
-        {
-            $type = SymbolTable::resolveSymbolAttribTypeName($symboltableref);
-            $result = { type => $type };
-            last SWITCH;
-        };
-        do
-        {
-            die "can't resolve parameter to a type string";
-        }
-    };
-
-    return $result;
 }
 
 ##
@@ -2129,16 +2385,15 @@ sub processArray
     ##
     #   create a dedicated element type if it has more than one attribute
     ##
-
     if (exists $result->{attriblist} && scalar @{$result->{attriblist}} > 1)
     {
         my $elementtypename = $result->{name};
         my $arraytypename   = $elementtypename . "ArrayType";
 
         $result->{name}     = $elementtypename;
-        SymbolTable::createSymbolTableEntry($result);
+        SymbolTable::createSymboltableEntry($result);
 
-        $result             = SymbolTable::createSymbolTableReference($elementtypename);
+        $result             = SymbolTable::createSymboltableReference($elementtypename);
         $result->{name}     = $arraytypename;
     }
 
@@ -2176,7 +2431,7 @@ sub copyPolymorphProperties
             $result->{name} = $propertyname;
             push @$attriblist, $result;
             my $propertyclassname = SymbolTable::resolveDatatypeName($result);
-            $classimports = addImportedClass($classimports, $propertyclassname);
+            $classimports = addImportedClass($classimports, $propertyclassname) if defined $propertyclassname;
         }
     }
 
@@ -2193,7 +2448,7 @@ sub mergeReferencedClass
 {
     my ($level, $typePrefix, $parenttypename, $reference, $attriblist, $classimports) = @_;
 
-    my $entry = SymbolTable::resolveSymbolReference($reference);
+    my $entry = SymbolTable::resolveSymboltableReference($reference);
 
     SWITCH:
     {
@@ -2220,7 +2475,6 @@ sub mergeReferencedClass
         do
         {
             die "mergeReferencedClass : unsupported copy operation";
-            last SWITCH;
         };
     }
 
@@ -2233,6 +2487,11 @@ sub processPolymorphType
 
     my $filename = 'swagger file';
     $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
+
+    # if ( $parenttypename eq 'HostConfig' )
+    # {
+    #     printf "found!\n";
+    # }
 
     my $inheritancetype = extractPolymorphType($parenttype);
     if (scalar @$inheritancetype != 1)
@@ -2327,11 +2586,11 @@ sub processPolymorphType
     ##
     if (!$doExtendBaseType)
     {
-        $result = SymbolTable::createSymbolTableEntry($result);
+        $result = SymbolTable::createSymboltableEntry($result);
     }
 
-    $result = SymbolTable::createSymbolTableEntry($result);
-    $result = SymbolTable::createSymbolTableReference($result->{name});
+    $result = SymbolTable::createSymboltableEntry($result);
+    $result = SymbolTable::createSymboltableReference($result->{name});
 
     return $result;
 }
@@ -2365,8 +2624,8 @@ sub processLinks
     if ((exists $result->{type} && $result->{type} eq 'array') && exists $result->{reference})
     {
         $result->{name} = $parenttypename;
-        $result = SymbolTable::createSymbolTableEntry($result);
-        $result = SymbolTable::createSymbolTableReference($parenttypename);
+        $result = SymbolTable::createSymboltableEntry($result);
+        $result = SymbolTable::createSymboltableReference($parenttypename);
     }
 
     return $result;
@@ -2389,11 +2648,11 @@ sub processContent
         $result = processSingleItem($level + 1, $typePrefix, $parenttypename, $content->{$contenttype}, 0);
     }
 
-    if ((exists $result->{type} && $result->{type} eq 'array') && exists $result->{reference})
+    if (exists $result->{type} && $result->{type} eq 'array' && exists $result->{reference})
     {
         $result->{name} = $parenttypename;
-        $result = SymbolTable::createSymbolTableEntry($result);
-        $result = SymbolTable::createSymbolTableReference($parenttypename);
+        $result = SymbolTable::createSymboltableEntry($result);
+        $result = SymbolTable::createSymboltableReference($parenttypename);
     }
 
     return $result;
@@ -2402,6 +2661,11 @@ sub processContent
 sub processProperties
 {
     my ($level, $typePrefix, $parenttypename, $parenttype, $forceEntry) = @_;
+
+    # if ($parenttypename eq "IPAM")
+    # {
+    #     printf "found!\n";
+    # }
 
     my $filename = 'swagger file';
     $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
@@ -2418,7 +2682,6 @@ sub processProperties
     #   collect all elements of the composite type
     #   add optional after required attributes
     ##
-
     my $attribcardinality = {};
     map {
         $attribcardinality->{$_} = 'todo';
@@ -2467,6 +2730,16 @@ sub processProperties
         #   only add non-alias symboltable entries to the class import list
         ##
         $classimports = addImportedClass($classimports, $attribref->{reference}) if exists $attribref->{reference};
+
+        ##
+        #   import class(es) referred to in hash table
+        ##
+        if (exists $attribref->{isMap} && exists $attribref->{classimports})
+        {
+            map {
+                $classimports = addImportedClass($classimports, $_);
+            } keys %{$attribref->{classimports}};
+        }
     }
 
     ##
@@ -2488,9 +2761,9 @@ sub processProperties
     $result = { name => $syntheticName, attriblist => $attriblist, classimports => $classimports };
     $result->{isDummyClass} = 'true' if $isDummyClass;
 
-    SymbolTable::createSymbolTableEntry($result);
+    SymbolTable::createSymboltableEntry($result);
 
-    $result = SymbolTable::createSymbolTableReference($syntheticName);
+    $result = SymbolTable::createSymboltableReference($syntheticName);
 
     return $result;
 }
@@ -2498,6 +2771,11 @@ sub processProperties
 sub processAdditionalProperties
 {
     my ($level, $typePrefix, $parenttypename, $parenttype, $forceEntry) = @_;
+
+    # if ($parenttypename eq "PortMap")
+    # {
+    #     printf "found!\n";
+    # }
 
     my $filename = 'swagger file';
     $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
@@ -2516,17 +2794,29 @@ sub processAdditionalProperties
         return { name => $parenttypename, definition => { type => 'string' }, isDefaulted => 'true' };
     }
 
-    my $result = processSingleItem($level + 1, $typePrefix, $parenttypename, $additionalProperties, 0);
+    my $temp = processSingleItem($level + 1, $typePrefix, $parenttypename, $additionalProperties, 0);
 
-    ##
-    #   if the derived type is just an array of the base type, we declare it an alias.
-    ##
-    if ((exists $result->{type} && $result->{type} eq 'array') && exists $result->{reference})
+    my $result = {
+        name        => $parenttypename,
+        type        => 'object',
+        isMap   => 'true',
+        hashKeyType => 'string',
+        hashValType => $temp
+    };
+
+    if (exists $temp->{reference})
     {
-        $result->{name}    = $parenttypename;
-        $result->{isAlias} = 'true';
-        $result            = SymbolTable::createSymbolTableEntry($result);
-        $result            = SymbolTable::createSymbolTableReference($parenttypename);
+        my $classimports = { $temp->{reference} => 1 };
+        $result->{classimports} = $classimports;
+    }
+
+    # 'additionalProperties' are mapped to Map<String,objecttype>
+    # so we don't require a symbol table entry unless it is a 1st level
+    # entry from the swagger definitions.
+    if ( $forceEntry )
+    {
+        $result = SymbolTable::createSymboltableEntry($result);
+        $result = SymbolTable::createSymboltableReference($parenttypename);
     }
 
     return $result;
@@ -2569,8 +2859,8 @@ sub processParameters
     my $result        = {};
 
     $result = { name => $syntheticName, attriblist => $attriblist, classimports => $classimports };
-    SymbolTable::createSymbolTableEntry($result);
-    $result = SymbolTable::createSymbolTableReference($syntheticName);
+    SymbolTable::createSymboltableEntry($result);
+    $result = SymbolTable::createSymboltableReference($syntheticName);
 
     return $result;
 }
@@ -2584,7 +2874,7 @@ sub processReference
     my $name      = $childtype->{name};
     my $result    = $symboltable->{$name};
 
-    return SymbolTable::createSymbolTableReference($name) if exists $childtype->{isSymbolDefined};
+    return SymbolTable::createSymboltableReference($name) if exists $childtype->{isSymbolDefined};
 
     $symboltable->{$name}{status} = 'open'; # put a marker into the symbol table that this type is undergoing analysis
 
@@ -2592,13 +2882,13 @@ sub processReference
 
     return $result if exists $result->{reference};
 
-    $result       = SymbolTable::createSymbolTableEntry($result);
+    $result       = SymbolTable::createSymboltableEntry($result);
 
     ##
     #   return a reference to a symbol table entry to avoid
     #   cluttering it with 'array' tags from anonymous arrays.
     ##
-    $result       = SymbolTable::createSymbolTableReference($result->{name});
+    $result       = SymbolTable::createSymboltableReference($result->{name});
 
     return $result;
 }
@@ -2739,6 +3029,7 @@ sub processSingleItem
         ##
         (exists $itemtype->{additionalProperties}) && do
         {
+            die "$itemname : type='object' not found" if !exists $itemtype->{type} || ref $itemtype->{type} ne '' || $itemtype->{type} ne 'object';
             $result = processAdditionalProperties($level + 1, $typePrefix, $itemname, $itemtype, 0);
             last SWITCH;
         };
@@ -2774,12 +3065,11 @@ sub processSingleItem
         };
         do {
             die "[$filename] unexpected attribute type for attribute $itemname";
-            last SWITCH;
         };
     }
 
     my $symref             = $result;
-    $symref                = SymbolTable::resolveSymbolReference($result) if exists $result->{reference};
+    $symref                = SymbolTable::resolveSymboltableReference($result) if exists $result->{reference};
 
     $symref->{description} = $itemtype->{description} if exists $itemtype->{description};
     $symref->{example}     = $itemtype->{example}     if exists $itemtype->{example};
@@ -2794,7 +3084,7 @@ sub processSingleItem
     {
         if (!exists $result->{definition} && !exists $result->{reference} && !exists $result->{status} && !exists $symboltable->{$itemname})
         {
-            $result = SymbolTable::createSymbolTableEntry($result);
+            $result = SymbolTable::createSymboltableEntry($result);
         }
     }
 
@@ -2839,8 +3129,23 @@ sub processAttribute
     ##
     if (exists $result->{reference} && defined $exposed)
     {
-        my $symref         = SymbolTable::resolveSymbolReference($result);
+        my $symref         = SymbolTable::resolveSymboltableReference($result);
         $symref->{exposed} = $exposed;
+
+        ##
+        #   propagate 'exposed' property to child types, so that
+        #   we have class instantiation code available for them.
+        #
+        #   CAVEAT: this (intentionally) does not recurse over the
+        #           dependency graph. if it did, we could just
+        #           generate instantiation code for all classes.
+        ##
+        if (exists $symref->{classimports})
+        {
+            map {
+                $symboltable->{$_}{exposed} = $exposed
+            } keys %{$symref->{classimports}};
+        }
     }
 
     return $result;
@@ -2887,7 +3192,9 @@ sub mergeBodyParameter
 ##
 #   processEndPointParameters :
 #
-#   process endpoint parameters
+#   process endpoint parameters.
+#   each parameter is linked to its resolved datatype.
+#   this can either be a symbol table entry or a java datatype.
 ##
 sub processEndPointParameters
 {
@@ -2917,6 +3224,10 @@ sub processEndPointParameters
         my $classdefinition;
         my $typePrefix = generateTypePrefix("${endpoint}-${method}");
 
+        ##
+        #   the only legal way to have '$param->{in}' missing is
+        #   having a parameter resolve to an external reference.
+        ##
         if (!exists $param->{in})
         {
             die "reference expected while missing {in} : ${method}::${endpoint}" if !exists $param->{'$ref'};
@@ -2932,8 +3243,7 @@ sub processEndPointParameters
                 $paramname       = $param->{name} if exists $param->{name};
                 $classdefinition = processAttribute($typePrefix, $paramname, $param, 'inbound');
 
-                my $p            = deriveParamType($classdefinition);
-                my $paramtype    = $p->{type};
+                my $paramtype    = SymbolTable::resolveSymbolAttribTypeName($classdefinition);
 
                 if (!defined $requestBody)
                 {
@@ -2986,8 +3296,7 @@ sub processEndPointParameters
                     my $paramname = " ";
                     $paramname    = $param->{name} if exists $param->{name};
 
-                    my $p         = deriveParamType($classdefinition);
-                    my $paramtype = $p->{type};
+                    my $paramtype = SymbolTable::resolveSymbolAttribTypeName($classdefinition);
 
                     printf "[%-8s] %-45s[%-9s] : %s\n"
                         , $param->{in}
@@ -2999,7 +3308,6 @@ sub processEndPointParameters
             };
             do {
                 die "$param->{name} : unsupported parameter type $param->{in}";
-                last SWITCH;
             };
         }
     }
@@ -3008,7 +3316,9 @@ sub processEndPointParameters
 ##
 #   processEndPointResponses :
 #
-#   process endpoint responses
+#   process endpoint responses.
+#   each response is linked to its resolved datatype.
+#   this can either be a symbol table entry or a java datatype.
 ##
 sub processEndPointResponses
 {
@@ -3043,8 +3353,8 @@ sub processEndPointResponses
         {
             $typePrefix = generateTypePrefix("${endpoint}-${method}");
             $typeName   = "Rc${key}";
-            #$typeName = Parser::addCamelSuffix( $typePrefix, $typeName );
 
+            #$typeName = Parser::addCamelSuffix( $typePrefix, $typeName );
             # if (exists $response->{schema}{title})
             # {
             #     $typeName = $response->{schema}{title};
@@ -3086,10 +3396,10 @@ sub processEndPointResponses
 
         if (MAIN::checkOption($configoptions, 'reportonly', 'flags'))
         {
-            my $responsetype = deriveParamType($classdefinition);
+            my $responsetype = SymbolTable::resolveSymbolAttribTypeName($classdefinition);
             my $description  = CodeGenerator::formatDescriptionAsOneLine($response->{description}, 72, { dontescapeapostrophes => 'true' }) if exists $response->{description};
             $description     = "" if !defined $description;
-            printf "[%-8s] %-45s %-9s  : %s\n", $key, $responsetype->{type}, " ", $description;
+            printf "[%-8s] %-45s %-9s  : %s\n", $key, $responsetype, " ", $description;
         }
     }
 }
@@ -3331,7 +3641,9 @@ sub formatConstraints
 
     my $attribconstraints = "";
 
-    if (exists $datatype->{type} && $datatype->{type} eq 'array')
+    return $attribconstraints if !defined $typename;
+
+    if (exists $datatype->{type} && $datatype->{type} eq 'array' && !exists $datatype->{isMap})
     {
         if (!exists $datatype->{definition} && !exists $datatype->{reference} && !exists $datatype->{attriblist})
         {
@@ -3360,6 +3672,7 @@ sub concatAttrNames
     my $s = '';
     my $delim = '';
     map {
+        die "concatAttrNames : attribute is either not a hash or is missing 'name'" if ref($_) ne 'HASH' || !exists $_->{name};
         $s .= ${delim} . $_->{name};
         $delim = ' :: ';
     } @$attrlist;
@@ -3390,7 +3703,7 @@ sub extractJsonCardinality
 {
     my ($attr, $values) = @_;
 
-    die "\$attr is not a hash" if ref $attr ne 'HASH';
+    die "\$attr is not a hash"     if ref $attr ne 'HASH';
     die "\$values is not an array" if ref $values ne 'ARRAY';
 
     return $values->[1] if !exists $attr->{required};
@@ -3401,7 +3714,7 @@ sub extractParamCardinality
 {
     my ($attr, $values) = @_;
 
-    die "\$attr is not a hash" if ref $attr ne 'HASH';
+    die "\$attr is not a hash"     if ref $attr ne 'HASH';
     die "\$values is not an array" if ref $values ne 'ARRAY';
 
     return $values->[1] if !exists $attr->{required};
@@ -3479,6 +3792,7 @@ sub extractEnumDefaultValue
         $val          =~ s/[^A-Z0-9_]//ig;
         next if $val eq "";
         $defaultvalue = $val if !defined $defaultvalue;
+        last if defined $defaultvalue;
     }
 
     return $defaultvalue;
@@ -3544,6 +3858,11 @@ sub collectClassAttributeList
             push @$temp, $classentry;
             last SWITCH;
         };
+        (exists $classentry->{isMap}) && do
+        {
+            push @$temp, $classentry;
+            last SWITCH;
+        };
         do {
             die "can't derive attributes for class $classname";
         }
@@ -3575,13 +3894,17 @@ sub generateModelInbuiltInstance
     my ($level, $attribdelim, $attribname, $classname, $cardinality) = @_;
 
     my $defaultvalue = undef;
-    $defaultvalue = "\"${attribname}\"" if $classname =~ /string/i;
+    $defaultvalue = "\"${attribname}\""     if $classname =~ /string/i;
     $defaultvalue = "new BigInteger(\"0\")" if $classname =~ /integer/i;
-    $defaultvalue = "new BigDecimal(0.0)" if $classname =~ /number/i;
-    $defaultvalue = "true" if $classname =~ /boolean/i;
-    $defaultvalue = "null" if $classname =~ /object/i;
-    $defaultvalue = "null" if $classname =~ /void/i;
-    $defaultvalue = "null" if $classname =~ /null/i;
+    $defaultvalue = "new BigDecimal(0.0)"   if $classname =~ /number/i;
+    $defaultvalue = "true"                  if $classname =~ /boolean/i;
+    ##
+    #   use a string instead of a null object to prevent serialization errors
+    #   in HashMap<String,null>
+    ##
+    $defaultvalue = "\"null object\""       if $classname =~ /object/i;
+    $defaultvalue = "null"                  if $classname =~ /void/i;
+    $defaultvalue = "null"                  if $classname =~ /null/i;
 
     if (!defined $defaultvalue)
     {
@@ -3610,17 +3933,78 @@ sub generateModelEnumInstance
 {
     my ($level, $attribdelim, $attribname, $attr, $enumclassname, $classimports, $cardinality) = @_;
 
-    my $enum = isEnumType($attr);
+    my $enum         = isEnumType($attr);
+
     die "$attribname is not an enum declaration " if !defined $enum;
 
-    my $defaultvalue = CodeGenerator::extractEnumDefaultValue($attr);
-    my $is = ' ' x (4 * $level);
-    my $temp = "${is}${attribdelim}${enumclassname}._${defaultvalue}";
-    my $padding = "";
-    $padding = ' ' x (88 - length($temp)) if length($temp) < 88;
+    my $defaultvalue = extractEnumDefaultValue($attr);
+    my $is           = ' ' x (4 * $level);
+    my $temp         = "${is}${attribdelim}${enumclassname}._${defaultvalue}";
+    my $padding      = "";
+    $padding         = ' ' x (88 - length($temp)) if length($temp) < 88;
 
     my $output = <<"EOT";
-${temp}${padding}// $cardinality $attribname
+${temp}${padding}// [$cardinality] $attribname
+EOT
+
+    return $output;
+}
+
+##
+#   generateModelMapInstance
+#
+#   generate an instantiation statement for 2 different flavours of HashMap<K,V> declaration
+##
+sub generateModelMapInstance
+{
+    my ($level, $attribdelim, $attribname, $modelpackage, $attr, $classimports, $cardinality) = @_;
+
+    my $is              = ' ' x (4 * $level);
+
+    my $hashKeyType     = $attr->{hashKeyType};
+    die "$hashKeyType key type of attribute $attribname is not an inbuilt type" if !exists $inbuilttypes->{$hashKeyType};
+    $hashKeyType        = $inbuilttypes->{$hashKeyType};
+
+    my $hashValType     = $attr->{hashValType};
+    my $isMapOfList     = exists $hashValType->{type} && $hashValType->{type} eq 'array';
+
+    my $valclassname    = SymbolTable::resolveDatatypeName( $hashValType );
+
+    my $temp            = "${is}${attribdelim}Maps.newHashMap( ImmutableMap.of(";
+
+    my $padding         = "";
+    $padding            = ' ' x (88 - length($temp)) if length($temp) < 88;
+
+    my $valInstance;
+    my $keyindent;
+
+    ##
+    #   process HashMap<String, ArrayList<T>> declarations
+    ##
+    if ($isMapOfList)
+    {
+        $valInstance    = generateModelClassInstance($level+2, ' ', "${attribname}.value", $modelpackage, $valclassname, $classimports, 'optional');
+        $valclassname   = $inbuilttypes->{$valclassname} if exists $inbuilttypes->{$valclassname};
+        $keyindent      = "${is}    ";
+
+        my $arraytype   = "ArrayList<$valclassname>";
+        $valInstance    = <<"EOT";
+${is}    ,new ${arraytype}(
+${is}         Arrays.asList(
+${valInstance}${is}     ))
+EOT
+    }
+    else
+    {
+        $valInstance    = generateModelClassInstance($level+1, ',', "${attribname}.value", $modelpackage, $valclassname, $classimports, 'optional');
+        $valInstance    =~ m/^( +)[^ ]/;
+        $keyindent      = $1;
+    }
+
+    my $output = <<"EOT";
+${temp}${padding}// [$cardinality] $attribname
+${keyindent} "${attribname}.key"
+${valInstance}${is} ))
 EOT
 
     return $output;
@@ -3636,14 +4020,14 @@ sub generateModelClassInstance
 {
     my ($level, $attribdelim, $attribname, $modelpackage, $classname, $classimports, $cardinality) = @_;
 
-    # if ($classname eq "DbPaymentTransactionInformation")
+    # if ($classname eq "IPAM")
     # {
     #     printf "found!\n";
     # }
 
     if (exists $inbuilttypes->{$classname})
     {
-        return generateModelInbuiltInstance($level + 1, $attribdelim, $attribname, $classname, $cardinality);
+        return generateModelInbuiltInstance($level, $attribdelim, $attribname, $classname, $cardinality);
     }
 
     if (!exists $symboltable->{$classname})
@@ -3715,6 +4099,28 @@ sub generateModelClassInstance
 
         SWITCH:
         {
+            ##
+            #   CAVEAT: intercept Maps before any other type, since the name does not refer to a symbol table entry
+            ##
+            (exists $attr->{isMap}) && do
+            {
+                my $temp = generateModelMapInstance($isArray ? $level+3 : $level+1, $isArray ? ' ' : $delim, $dtoattributename, $modelpackage, $attr, $classimports, $dtoattribcardinality);
+                ##
+                #   process ArrayList<HashMap<String,T>> declaration
+                ##
+                if ( $isArray )
+                {
+                    my $elementtypename = SymbolTable::deriveMapTypeDeclaration($attr, {}, {'usejava' => 'true'});
+                    my $arraytype = "ArrayList<$elementtypename>";
+                    $temp = <<"EOT";
+${is}${delim}new $arraytype(
+${is}     Arrays.asList(
+${temp}${is} ))
+EOT
+                }
+                $output .= $temp;
+                last SWITCH;
+            };
             ($isArray) && do
             {
                 my $elementtypename    = SymbolTable::resolveDatatypeName($attr);
@@ -3731,8 +4137,8 @@ ${is}     Arrays.asList(
 EOT
                 $output .= $temp;
 
-                # indentation for ArrayList elements is twice that of 'new'
-                $temp = generateModelClassInstance($level + 2, ' ', $dtoattributename, $modelpackage, $dtoattributetype, $classimports, $dtoattribcardinality);
+                # relative indentation for ArrayList elements is twice that of 'new'
+                $temp = generateModelClassInstance($level + 3, ' ', $dtoattributename, $modelpackage, $dtoattributetype, $classimports, $dtoattribcardinality);
                 $output .= $temp;
                 $output .= "${is} ))\n";
                 last SWITCH;
@@ -3802,12 +4208,12 @@ EOT
         }
 
         $output = "$dtoclassimports\n$output";
-    }
 
-    ##
-    #   wrap the entire code fragment into a java multiline comment.
-    ##
-    $output = "/*\n${output}*/\n\n" if !$level;
+        ##
+        #   wrap the entire code fragment into a java multiline comment.
+        ##
+        $output = "/*\n${output}*/\n\n";
+    }
 
     return $output;
 }
@@ -3815,11 +4221,15 @@ EOT
 ##
 #   generateEnumClassDefinition :
 #
-#   generate an enum class
+#   generate 2 flavours of enum class definition :
+#   - standalone
+#   - embedded (inner class)
 ##
 sub generateEnumClassDefinition
 {
     my ($classname, $symref, $ucdtoattributename, $modelpackage, $options) = @_;
+
+    return undef if !defined $classname;
 
     my $enum            = isEnumType($symref, $classname);
 
@@ -3840,32 +4250,45 @@ sub generateEnumClassDefinition
         my $temp = <<"EOT";
 ${is}${delim}_${val}("${val}")
 EOT
-        $delim = ",";
         $enumvalueclause .= $temp;
+        $delim = ",";
     }
 
     $enumvalueclause .= $is . ";";
 
     my $enumclassimportclause = "";
+    my $xmlconfiguration      = "";
 
     ##
     #   prefix a standalone class definition
     ##
     if (!exists $options->{embedded})
     {
+        my $xmlimportclasses      = "";
+        if ( MAIN::checkOption($configoptions, 'xmlSerialization') )
+        {
+            $xmlconfiguration = "\n\@JacksonXmlRootElement\n";
+            $xmlimportclasses = << "EOT";
+
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlElementWrapper;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+EOT
+        }
+
         $enumclassimportclause = <<"EOT";
 package ${modelpackage};
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonValue;
-import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonCreator;${xmlimportclasses}
 
 EOT
     }
 
     my $enumclassdeclaration = <<"EOT";
-${enumclassimportclause}public enum ${classname}
+${enumclassimportclause}${xmlconfiguration}public enum ${classname}
 {
 ${enumvalueclause}
 
@@ -3907,10 +4330,10 @@ EOT
 ##
 # generateClassAttributeClauses
 #
-# derive bits and pieces for class attributes and methods from the symbol attrib list
+# derive bits and pieces for model class attributes and methods from the symbol attrib list
 #
-# dtoclassajsonattributelist
-# dtoclassinitialisationlist
+# dtoclassajsonattributelist    json-annotated instance variables
+# dtoclassinitialisationlist    instance variables initialize to go into the constructor
 # gettersettermethods           get and set methods
 # dtoclassattributestostring    body of toString() method
 #
@@ -3928,6 +4351,8 @@ sub generateClassAttributeClauses
 
     die "collectClassAttributeClauses : $classname not found in symboltable" if !exists $symboltable->{$classname};
 
+    my $classentry                 = $symboltable->{$classname};
+
     my $dtoclassajsonattributelist = "";
     my $dtoclasstypedattributelist = "";
     my $dtoclassparmattributelist  = "";
@@ -3939,8 +4364,26 @@ sub generateClassAttributeClauses
     my $tosconcat                  = "  ";
     my $tosdelim                   = "";
 
-    my $collectedattributes       = collectClassAttributeList($classname);
-    my $classattributesbaseclass  = $collectedattributes->{classattributesbaseclass};
+    my $collectedattributes        = collectClassAttributeList($classname);
+    my $classattributesbaseclass   = $collectedattributes->{classattributesbaseclass};
+
+    if ( scalar @$classattributesbaseclass == 0 )
+    {
+        my $filename = 'swagger file';
+        $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
+
+        if (exists $classentry->{extendedbasetype})
+        {
+            my $extendedbasetype      = $classentry->{extendedbasetype};
+            my $extendedbaseclassname = $extendedbasetype->{name};
+
+            warn "[$filename] class $classname extends $extendedbaseclassname but has no attributes of its own.";
+        }
+        else
+        {
+            die "[$filename] INTERNAL : class $classname has no attributes.";
+        }
+    }
 
     ##
     #   CAVEAT : only process base class attributes
@@ -3958,7 +4401,7 @@ sub generateClassAttributeClauses
         my $dereferencedAttribute = SymbolTable::resolveTypeAlias($attr);
 
         $attr                     = $dereferencedAttribute->{attribute} if exists $dereferencedAttribute->{attribute};
-        $isArray                  = $dereferencedAttribute->{isArray} if exists $dereferencedAttribute->{isArray};
+        $isArray                  = $dereferencedAttribute->{isArray}   if exists $dereferencedAttribute->{isArray};
 
         my $dtoattributetype      = SymbolTable::resolveDatatypeName($attr);
 
@@ -3977,14 +4420,41 @@ sub generateClassAttributeClauses
 
         my $constraintopening     = ($attribdescription ne "") ? ' * ' : '/**';
         $attribconstraints        = "    ${constraintopening}${attribconstraints}\n     */\n" if $attribconstraints ne "";
+
+        my $xmlAnnotation         = "";
+
         SWITCH:
         {
+            ##
+            #   CAVEAT: intercept Map types before anything else, since they are not stored in the symbol table
+            ##
+            (exists $attr->{isMap}) && do
+            {
+                $dtoattributetype = SymbolTable::deriveMapTypeDeclaration($attr, {}, {'usejava' => 'true'});
+                $dtoattributetype = "ArrayList<${dtoattributetype}>" if $isArray;
+
+                if (MAIN::checkOption($configoptions, 'xmlSerialization'))
+                {
+                    $xmlAnnotation    = << "EOT";
+    \@JacksonXmlProperty(localName = "${dtoattributename}")
+    \@JacksonXmlElementWrapper(useWrapping = false)
+EOT
+                }
+                last SWITCH;
+            };
             ($isArray) && do
             {
                 my $elementtype   = SymbolTable::resolveDatatypeName($attr);
                 $elementtype      = $inbuilttypes->{$elementtype} if exists $inbuilttypes->{$elementtype};
                 $dtoattributetype = "ArrayList<$elementtype>";
 
+                if (MAIN::checkOption($configoptions, 'xmlSerialization'))
+                {
+                    $xmlAnnotation    = << "EOT";
+    \@JacksonXmlProperty(localName = "${dtoattributename}")
+    \@JacksonXmlElementWrapper(useWrapping = false)
+EOT
+                }
                 last SWITCH;
             };
             (defined $enumclassinfo) && do
@@ -4002,11 +4472,25 @@ sub generateClassAttributeClauses
                 {
                     $dtoattributetype = $attr->{name};
                 }
+
+                if (MAIN::checkOption($configoptions, 'xmlSerialization'))
+                {
+                    $xmlAnnotation = <<"EOT";
+    \@JacksonXmlProperty(localName = "${dtoattributename}")
+EOT
+                }
                 last SWITCH;
             };
             (exists $inbuilttypes->{$dtoattributetype}) && do
             {
                 $dtoattributetype = $inbuilttypes->{$dtoattributetype};
+
+                if (MAIN::checkOption($configoptions, 'xmlSerialization'))
+                {
+                    $xmlAnnotation = << "EOT";
+    \@JacksonXmlProperty(localName = "${dtoattributename}")
+EOT
+                }
                 last SWITCH;
             };
             do {
@@ -4017,8 +4501,8 @@ sub generateClassAttributeClauses
             };
         }
 
-        my $dtoattribcardinality = "";
-        my $dtojsoncardinality   = "";
+        my $dtoattribcardinality  = "";
+        my $dtojsoncardinality    = "";
 
         if (MAIN::checkOption($configoptions, 'attribCardinality'))
         {
@@ -4033,12 +4517,11 @@ sub generateClassAttributeClauses
         }
 
         my $dtotypedattribute        = "$dtoattributetype $lcdtoattributename";
-        $dtoclasstypedattributelist .= "\n        " if length($dtotypedattribute) > 60;
         $dtoclasstypedattributelist  = "${dtoclasstypedattributelist}${ctadelim}${dtotypedattribute}";
 
         $dtoclassparmattributelist  .= "${ctadelim}${lcdtoattributename}";
 
-        $ctadelim = ', ';
+        $ctadelim   = ', ';
 
         my $temp;
 
@@ -4047,7 +4530,7 @@ sub generateClassAttributeClauses
         $padding    = ' ' x $padding;
         $temp = <<"EOT";
 ${enumclassdeclaration}${attribdescription}${attribconstraints}    \@JsonProperty${dtojsoncardinality}
-    \@JsonIgnore
+${xmlAnnotation}    \@JsonIgnore
     private ${dtotypedattribute};${padding}${dtoattribcardinality}
 
 EOT
@@ -4090,8 +4573,6 @@ EOT
         , dtoclassattributestostring     => $dtoclassattributestostring
     };
 
-    my $classentry = $symboltable->{$classname};
-
     ##
     #   recursively call generateClassAttributeClauses()
     #   to obtain parameter and attribute lists for the
@@ -4114,18 +4595,22 @@ EOT
 
         if (exists $temp->{xdtoclasstypedattributelist})
         {
-            $result->{xdtoclasstypedattributelist} .= "\n        " if length($result->{xdtoclasstypedattributelist}) > 60;
             $result->{xdtoclasstypedattributelist}  = $temp->{xdtoclasstypedattributelist} . ", " . $result->{xdtoclasstypedattributelist};
         }
+
         if (exists $temp->{xdtoclassparmattributelist})
         {
-            $result->{xdtoclassparmattributelist}  .= "\n        " if length($result->{xdtoclassparmattributelist}) > 60;
             $result->{xdtoclassparmattributelist}   = $temp->{xdtoclassparmattributelist} . ", " . $result->{xdtoclassparmattributelist};
         }
 
-        $temp = <<"EOT";
+        $temp = "            super.toString()";
+
+        if ($tosconcat ne "  ")
+        {
+            $temp = <<"EOT";
             super.toString() ${tosconcat}"${tosdelim}" ${tosconcat}
 EOT
+        }
 
         $result->{dtoclassattributestostring} = "${temp}${dtoclassattributestostring}";
     }
@@ -4133,6 +4618,37 @@ EOT
     return $result;
 }
 
+##
+#   formatParameterList :
+#
+#   distribute parameters of multiple lines if the parameter line length exceeds a maximum
+##
+sub formatParameterList
+{
+    my ( $parameterline, $maxlength ) = @_;
+
+    return $parameterline if length($parameterline) <= $maxlength;
+
+    my @paramarray = split ', ', $parameterline;
+
+    $parameterline = '';
+    my $temp       = "\n" . ' ' x 6;
+    my $delim      = '  ';
+    for my $param (@paramarray)
+    {
+        if ( length($temp) + length($param) > $maxlength )
+        {
+            $parameterline .= "${temp}\n";
+            $temp = ' ' x 6;
+        }
+        $temp .= "${delim}${param}";
+        $delim = ", ";
+    }
+
+    $parameterline .= "${temp} ";
+
+    return $parameterline;
+}
 
 ##
 #   generateModelClassDefinition :
@@ -4143,17 +4659,17 @@ sub generateModelClassDefinition
 {
     my ($classname) = @_;
 
-    # if ($classname eq "DbUniqueIdentifierOther")
-    # {
-    #     printf "found!\n";
-    # }
-
     my $modelpackage = $configoptions->{model}{package};
     my $outputpath   = $configoptions->{model}{path};
 
     die "INTERNAL ERROR : generateModelClassDefinition : $classname not found in symboltable" if !exists $symboltable->{$classname};
 
     my $classentry   = $symboltable->{$classname};
+
+    # if ($classname eq "EndpointSettings")
+    # {
+    #     printf "found!\n";
+    # }
 
     ##
     #   return if this is an alias entry or a dummy class
@@ -4195,11 +4711,22 @@ sub generateModelClassDefinition
         my $extendedbaseclassname       = $extendedbasetype->{name};
         $extendsclause                  = " extends ${extendedbaseclassname}";
 
+        ##
+        #   concatenate base type and derived type attribute lists
+        ##
         my $xdtoclasstypedattributelist = $classattributes->{xdtoclasstypedattributelist};
-        $dtoclasstypedattributelist     = "${xdtoclasstypedattributelist}, ${dtoclasstypedattributelist}";
+
+        $dtoclasstypedattributelist     = ($dtoclasstypedattributelist ne "")
+                                          ? "${xdtoclasstypedattributelist}, ${dtoclasstypedattributelist}"
+                                          : "${xdtoclasstypedattributelist}";
+
         my $xdtoclassparmattributelist  = $classattributes->{xdtoclassparmattributelist};
+
+        $xdtoclassparmattributelist     = formatParameterList($xdtoclassparmattributelist, 108);
+
         $initializesuperclause          = <<"EOT";
         super($xdtoclassparmattributelist);
+
 EOT
     }
 
@@ -4253,6 +4780,21 @@ EOT
     my $jsonconfiguration = "";
     $jsonconfiguration = "\@JsonInclude(JsonInclude.Include.NON_NULL)" if MAIN::checkOption($configoptions, 'jsonIncludeNonNull');
 
+    my $xmlconfiguration = "";
+    my $xmlimportclasses = "";
+    if ( MAIN::checkOption($configoptions, 'xmlSerialization') )
+    {
+        $xmlimportclasses = << "EOT";
+
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlElementWrapper;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+EOT
+        $xmlconfiguration = "\n\@JacksonXmlRootElement";
+    }
+
+    $dtoclasstypedattributelist = formatParameterList($dtoclasstypedattributelist, 108);
+
     my $completeclass = <<"EOT";
 package ${modelpackage};
 
@@ -4260,12 +4802,13 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonValue;
 import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnore;${xmlimportclasses}
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.HashMap;
 
-${dtoclassimports}${dtoclassinstance}${classdescription}${jsonconfiguration}
+${dtoclassimports}${dtoclassinstance}${classdescription}${jsonconfiguration}${xmlconfiguration}
 public class ${dtoclass}${extendsclause}
 {
 ${dtoclassajsonattributelist}
@@ -4276,7 +4819,7 @@ ${dtoclassajsonattributelist}
     }
 
     // parameterized constructor
-    public ${dtoclass}(${dtoclasstypedattributelist})
+    public ${dtoclass}( ${dtoclasstypedattributelist} )
     {
 ${initializesuperclause}${dtoclassinitialisationlist}    }
 ${gettersettermethods}
@@ -4335,10 +4878,13 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
 
 import javax.servlet.http.HttpServletRequest;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Maps;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -4383,7 +4929,7 @@ sub generateServiceClassMethod
 
     my $ucMethod = ucfirst Parser::formatCamelCase($servicemethodname, "[^A-Za-z0-9]+");
 
-    $invocationParameters = "\n${invocationParameters} " if $invocationParameters ne "";
+    $invocationParameters      = "\n${invocationParameters} " if $invocationParameters ne "";
 
     my $invocationResponseCode = 200;
     $invocationResponseCode    = $si->{responsecode} if exists $si->{responsecode} && $si->{responsecode} ne "";
@@ -4450,9 +4996,9 @@ sub generateServiceClassMethod
 
         ArrayList<$invocationResponseType> listResponse =
         new ArrayList<$invocationResponseType> (
-           Arrays.asList(
-               response
-           )
+            Arrays.asList(
+                response
+            )
         );
 EOT
     }
@@ -4678,7 +5224,7 @@ EOT
 ##
 #   generateControllerClassHeader :
 #
-#   generate a stub class header
+#   generate a class header
 ##
 sub generateControllerClassHeader
 {
@@ -4739,6 +5285,7 @@ package ${controllerpackage};
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 
 import io.swagger.annotations.Api;
@@ -4789,7 +5336,7 @@ EOT
 ##
 #   generateControllerClassParameterClauses :
 #
-#   generate a stub class method
+#   generate a class method
 ##
 sub generateControllerClassParameterClauses
 {
@@ -4858,7 +5405,7 @@ sub generateControllerClassParameterClauses
 
         my $classdefinition = $p->{classdefinition};
 
-        if (exists $classdefinition->{reference} && SymbolTable::resolveSymbolReference($classdefinition)->{isDummyClass})
+        if (exists $classdefinition->{reference} && SymbolTable::resolveSymboltableReference($classdefinition)->{isDummyClass})
         {
             my $filename = 'swagger file';
             $filename = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
@@ -4873,9 +5420,7 @@ sub generateControllerClassParameterClauses
         next if MAIN::checkOption($configoptions, 'skipAuthorization') && ($name =~ m/Authorization/i && defined $description && $description =~ m/Token/i);
 
         my $cardinality = extractParamCardinality($p, [ 'true', 'false' ]);
-
-        my $type = Parser::deriveParamType($classdefinition);
-        $type = $type->{type};
+        my $type        = SymbolTable::resolveSymbolAttribTypeName($classdefinition);
 
         ##
         #   suppress parameters that are typed 'null'.
@@ -4980,11 +5525,11 @@ sub generateControllerClassParameterClauses
         if ($spLineLength > 80)
         {
             $serviceParameters .= "\n                   ";
-            $spLineLength = 0;
+            $spLineLength       = 0;
         }
 
         $serviceParameters .= $lcname;
-        $spLineLength += length($lcname) + 2;
+        $spLineLength      += length($lcname) + 2;
     }
 
     return { section           => $parameterSection
@@ -4996,7 +5541,7 @@ sub generateControllerClassParameterClauses
 ##
 #   generateControllerClassResponseClauses :
 #
-#   generate a stub class method
+#   generate a class method
 ##
 sub generateControllerClassResponseClauses
 {
@@ -5050,7 +5595,7 @@ sub generateControllerClassResponseClauses
                 ##
                 #   map dummy classes to void response types.
                 ##
-                if (SymbolTable::resolveSymbolReference($classdefinition)->{isDummyClass})
+                if (SymbolTable::resolveSymboltableReference($classdefinition)->{isDummyClass})
                 {
                     my $filename = 'swagger file';
                     $filename    = basename($configoptions->{inputfile}) if exists $configoptions->{inputfile};
@@ -5082,8 +5627,8 @@ sub generateControllerClassResponseClauses
                     if (!exists $symboltable->{$type})
                     {
                         my $arrayOfType = {
-                            name             => $type
-                          , attriblist => [
+                            name           => $type
+                          , attriblist     => [
                                 {
                                      name     => 'arrayOf'
                                    , required => 'true'
@@ -5095,13 +5640,13 @@ sub generateControllerClassResponseClauses
                                      }
                                 }
                             ]
-                            , classimports   => { $elementtype => 1 }
-                            , exposed        => 1
-                            , processed      => 1
-                            , filename       => $configoptions->{inputfile}
+                          , classimports   => { $elementtype => 1 }
+                          , exposed        => 1
+                          , processed      => 1
+                          , filename       => $configoptions->{inputfile}
                         };
 
-                        SymbolTable::createSymbolTableEntry($arrayOfType);
+                        SymbolTable::createSymboltableEntry($arrayOfType);
                     }
                 }
                 last SWITCH;
@@ -5143,6 +5688,7 @@ sub deriveControllerClassname
 {
     # extract the classname for the controller class either from the metainformation
     # in the swaggerfile or from user input on the command line.
+
     my $classname = $inputhash->{tags}[0]{name}              if exists $inputhash->{tags} && exists $inputhash->{tags}[0]{name};
     $classname    = $inputhash->{info}{title}                if !defined $classname       && exists $inputhash->{info} && exists $inputhash->{info}{title};
     $classname    = $configoptions->{classnames}{controller} if exists $configoptions->{classnames}{controller};
@@ -5150,8 +5696,8 @@ sub deriveControllerClassname
     die "controllerclass classname undefined" if !defined $classname;
 
     # remove all non-alpha characters from the classname
-    $classname =~ s/[^A-Za-z]//g;
-    $classname = ucfirst($classname);
+    $classname    =~ s/[^A-Za-z]//g;
+    $classname    = ucfirst($classname);
 
     return $classname;
 }
@@ -5171,8 +5717,6 @@ sub deriveControllerMethodName
 
     my $controllermethodname = lcfirst Parser::generateTypePrefix("${method}-${endpoint}");
 
-    $controllermethodname = Parser::formatCamelCase($controllermethodname, "[^A-Za-z0-9]+") if $controllermethodname =~ "[^A-Za-z0-9]+";
-
     if (exists $collectedClassMethodIndex->{$controllermethodname})
     {
         my $filename1 = 'swagger file';
@@ -5189,7 +5733,7 @@ sub deriveControllerMethodName
 ##
 #   generateControllerClassMethod :
 #
-#   generate a stub class method exposing the 'parameters' and 'responses' interface from the swagger definition
+#   generate a class method exposing the 'parameters' and 'responses' interface from the swagger definition
 ##
 sub generateControllerClassMethod
 {
@@ -5210,12 +5754,12 @@ sub generateControllerClassMethod
     map {push @$parameters, $_} @{$pi->{parameters}} if exists $pi->{parameters};
     map {push @$parameters, $_} @{$mi->{parameters}} if exists $mi->{parameters};
 
-    my $summary                = $mi->{summary}     if exists $mi->{summary};
-    my $description            = $mi->{description} if exists $mi->{description};
-    my $consumes               = $mi->{consumes}    if exists $mi->{consumes};
-    my $produces               = $mi->{produces}    if exists $mi->{produces};
-    my $responses              = $mi->{responses}   if exists $mi->{responses};
-    my $tags                   = $mi->{tags}        if exists $mi->{tags};
+    my $summary                = $mi->{summary}      if exists $mi->{summary};
+    my $description            = $mi->{description}  if exists $mi->{description};
+    my $consumes               = $mi->{consumes}     if exists $mi->{consumes};
+    my $produces               = $mi->{produces}     if exists $mi->{produces};
+    my $responses              = $mi->{responses}    if exists $mi->{responses};
+    my $tags                   = $mi->{tags}         if exists $mi->{tags};
 
     ##
     #   ------------------  generate 'parameters' section ------------------------
@@ -5293,13 +5837,16 @@ sub generateControllerClassMethod
     my $producesclause       = "";
     if (defined $produces)
     {
-        my $producesstring   = Parser::array2ConcatenatedStrings($produces);
+        my $xmlContent       = "application/xml" if MAIN::checkOption($configoptions, 'xmlContent');
+        my $producesstring   = Parser::array2ConcatenatedStrings($produces, {additionalentry=>$xmlContent});
         $producesclause      = "            ,produces = { $producesstring }\n"
     }
+
     my $consumesclause       = "";
     if (defined $consumes)
     {
-        my $consumesstring   = Parser::array2ConcatenatedStrings($consumes);
+        my $xmlAccept        = "application/xml" if MAIN::checkOption($configoptions, 'xmlAccept');
+        my $consumesstring   = Parser::array2ConcatenatedStrings($consumes, {additionalentry=>$xmlAccept});
         $consumesclause      = "            ,consumes = { $consumesstring }\n"
     }
 
@@ -5353,17 +5900,17 @@ EOT
             implementation => $completemethod,
             invocation     =>
             {
-                inputfile                 => $filename,
-                endpoint                  => $endpoint,
-                method                    => $method,
-                controllermethodname      => $controllermethodname,
-                servicemethodname         => $servicemethodname,
-                parameters                => $invocationParameters,
-                parameterlist             => $parameterlist,
-                responsecode              => $invocationResponseCode,
-                responsetype              => $invocationResponseType,
-                responseIsArray           => $responseIsArray,
-                responseIsInbuilt         => $responseIsInbuilt
+                inputfile            => $filename,
+                endpoint             => $endpoint,
+                method               => $method,
+                controllermethodname => $controllermethodname,
+                servicemethodname    => $servicemethodname,
+                parameters           => $invocationParameters,
+                parameterlist        => $parameterlist,
+                responsecode         => $invocationResponseCode,
+                responsetype         => $invocationResponseType,
+                responseIsArray      => $responseIsArray,
+                responseIsInbuilt    => $responseIsInbuilt
             }
     };
 
@@ -5662,6 +6209,34 @@ sub addRelativePackage
 }
 
 ##
+#   dumpTaggedEndpoints
+#
+#   dump a listing of endpoints per controller class
+##
+sub dumpTaggedEndpoints
+{
+    return if scalar keys %$taggedEndpoints == 0;
+
+    printf "%s\n", '=' x 132;
+    printf "Endpoints per Controller\n\n";
+
+    my $widthcol1 = -1;
+    map {
+        $widthcol1 = length($_) if length($_) > $widthcol1;
+    } keys %$taggedEndpoints;
+
+    map {
+        my $endpoint = $_;
+        my $pad = ' ' x ($widthcol1 - length($endpoint));
+        my $temp = $endpoint;
+        map {
+            printf "%s%s : %s\n", $temp, $pad, $_;
+            $temp =~ s/./ /g;
+        } sort keys %{$taggedEndpoints->{$endpoint}};
+    } sort keys %$taggedEndpoints;
+}
+
+##
 #   processInputFile :
 #
 #   - collect the composite data types from the swaggerfile
@@ -5830,6 +6405,8 @@ sub processInputFile
             ##
             $collectedClassInformation->{controller} = [];
         }
+
+        dumpTaggedEndpoints() if MAIN::checkOption($configoptions, 'verbose', 'flags');
     }
     else
     {
@@ -5849,78 +6426,80 @@ sub printHelpScreenAndExit
 {
     my $usage = "usage: $scriptName [-dhlmsuvx] [-c <classnames>] [-o <configoptions>] -b <output path> -p <basepackage> [-e <endpoint>] [-i <json|yaml>] -|<infile1>[ <infile2> ...]";
 
-    my @helptext = (
-        "",
-        "${usage}",
-        "",
-        "generate model, controller and service classes and sample client instantiation code for all requests from an api's swagger file.",
-        "",
-        "Options:",
-        "",
-        "-d  dump the contents of the swaggerfile and exit",
-        "-h  print this help screen",
-        "-l  list endpoints and request bodies only. don't generate any code.",
-        "-m  don't abort when samenamed types from different input files mismatch.",
-        "-r  dump the definitions from the swaggerfile interleaved with the derived classes",
-        "-s  dump the symboltable after the inputfile is parsed.",
-        "-u  read/write files utf-8 encoded",
-        "-v  increase verbosity",
-        "-x  append path-derived suffixes to output path and basepackage",
-        "-z  plain dump of the swagger file, without any parsing",
-        "",
-        "Arguments:",
-        "",
-        "-b  base directory for generated output files. '-' for stdout.",
-        "-c  relative package and class names for model, controller and service classes :",
-        "          [model=controller.dto]|controller=[rest.controller.]EchoController|service=[rest.client.]EchoService",
-        "    CAVEAT: to define a relative model package add a '.', e.g. model=.dto",
-        "-e  generate interface classes for a single endpoint",
-        "-i  specify the input format when piping a swagger file to stdin",
-        "-p  base package to generate the classes in (defaults to: default)",
-        "    the base package will be converted to a relative path and added to the base directory",
-        "-o  configuration options delimited by '|' characters. supported options are :",
-        "",
-        "    ignoreMismatches         : don't abort when samenamed types from different input files mismatch. equivalent to -m",
-        "    skipAuthorization        : suppress 'Authorization' parameters carrying OAuth2 tokens",
-        "    extendBaseType           : extend the base type instead of adding new attributes for polymorph declarations",
-        "    attribCardinality        : add a mandatory/optional comment after a class attribute",
-        "    jsonCardinality          : add a (required=[true|false]) annotation to a \@JsonProperty annotation",
-        "    jsonIncludeNonNull       : suppress serialization of empty/null class attributes",
-        "    clusterByTag             : cluster the endpoints into controller classes by the 'tag' attribute",
-        "                               this overrides any class names specified in the -c option",
-        "    generateController       : generate a controller class exposing the REST endpoints",
-        "    generateControllerAdvice : generate controller advice classes",
-        "    generateService          : generate a service class that implements the operations",
-        "    generateClient           : generate code for creating request bodies for POST requests",
-        "    sharedModelPackage       : generate model classes in a single package. write new model class version on collision.",
-        "    dedicatedPackage         : append path-derived suffixes to output path and basepackage. equivalent to -x",
-        "                               this will prevent collisions between different implementations of like-named client classes",
-        "    useErrorResponse         : use a generic class 'ErrorResponse' instead of generated specific classes for all responses not 1xx or 2xx",
-        "    useArrayResponseType     : use a synthetic array class in a response instead of the (default) 'responseContainer = List' annotation",
-        "",
-        "                               openapi 3.0 introduced new response layouts 'links' and 'content'.",
-        "                               code generation is designed for either one with 'content' the default.",
-        "    enforceLinksResolution   : enforce resolution of the 'link' component of a response",
-        "",
-        "The generator resolves '\$ref' references to external files in the format <file>#/<reference> where <file> is  ",
-        "a filename relative to the directory of the primary input file and '#/<reference' is a regular local reference.",
-        "The definitions from the external file should come in one of the predefined sections (definitions, components, ",
-        "links, parameters). If the section is omitted, it defaults to 'definitions'.                                   ",
-        "If the external file holds only a single definition, the <reference> in the '\$ref' clause can be omitted.     ",
-        "It defaults to the definition from the file. If the external file holds multiple definitions and the reference ",
-        "is omitted from the '\$ref' clause, the processing run will fail with an error message.                        ",
-        "",
-        "Example for generating classes from a downloaded swaggerfile and writing them to stdout :",
-        "",
-        "curl -s -X GET http://openshift-echoservice-dk0429-a.router.default.svc.cluster.local:80/v2/api-docs \|\\",
-        "swaggercodegen.pl -sb -b ./src/main/java -o 'jsonCardinality|jsonIncludeNonNull|useErrorResponse|generateController|generateControllerAdvice\\",
-        "                               |generateService|generateClient|extendBaseType|clusterByTag' ",
-        "                   -c 'model=controller.model|controller=rest.controller.EchoController|service=rest.client.EchoService'",
-        "                   -p com.db.payment.service.directive.adapter.scgc -i json -",
-        "",
-    );
+    my $helptext = <<"EOT";
+    ${usage}
 
-    map {print $_ . "\n";} @helptext;
+    generate model, controller and service classes and model class instantiation code for all requests from an api's swagger file.
+
+    Options:
+
+    -d  dump the contents of the swaggerfile and exit
+    -h  print this help screen
+    -l  list endpoints and request bodies only. don't generate any code.
+    -m  don't abort when samenamed types from different input files mismatch.
+    -s  dump the symboltable after the inputfile is parsed.
+    -u  read/write files utf-8 encoded
+    -v  increase verbosity
+    -x  append path-derived suffixes to output path and basepackage
+    -z  plain dump of the swagger file, without any parsing
+
+    Arguments:
+
+    -b  base directory for generated output files. '-' for stdout.
+    -c  relative package and class names for model, controller and service classes :
+        Example :
+              [model=controller.model]|controller=[rest.controller.]EchoController|service=[rest.client.]EchoService
+        CAVEAT: to define a relative model package add a '.', e.g. model=.dto
+    -e  generate interface classes for a single endpoint
+    -i  specify the input format when piping a swagger file to stdin
+    -p  base package to generate the classes in (defaults to: default)
+        the base package will be converted to a relative path and added to the base directory
+    -o  configuration options delimited by '|' characters. supported options are :
+
+        ignoreMismatches         : don't abort when samenamed types from different input files mismatch. equivalent to -m
+        skipAuthorization        : suppress 'Authorization' parameters carrying OAuth2 tokens
+        extendBaseType           : for polymorph declarations: extend the base type instead of merging all attributes in a single class
+        attribCardinality        : add a mandatory/optional comment after a class attribute
+        jsonCardinality          : add a (required=[true|false]) annotation to a \@JsonProperty annotation
+        jsonIncludeNonNull       : suppress serialization of empty/null class attributes
+        xmlSerialization         : add annotations for (de)serialization (from)/to xml in the model classes
+        xmlContent               : add 'produces' annotations for application/xml in the controller classes
+        xmlAccept                : add 'consumes' annotations for application/xml in the controller classes
+        clusterByTag             : cluster the endpoints into controller classes by the 'tag' attribute
+                                   this overrides any class names specified in the -c option
+        generateController       : generate a controller class exposing the REST endpoints
+        generateControllerAdvice : generate controller advice classes
+        generateService          : generate a service class that implements the operations
+        generateClient           : generate instantiation statements for all exposed model classes
+        sharedModelPackage       : generate model classes in a single package. write new model class version on collision.
+        dedicatedPackage         : append path-derived suffixes to output path and basepackage. equivalent to -x
+                                   this will prevent collisions between different implementations of like-named client classes
+        useErrorResponse         : use a generic class 'ErrorResponse' instead of generated specific classes for all responses not 1xx or 2xx
+        useArrayResponseType     : use a synthetic array class in a response instead of the (default) 'responseContainer = List' annotation
+
+                                   openapi 3.0 introduced new response layouts 'links' and 'content'.
+                                   code generation is designed for either one with 'content' the default.
+        enforceLinksResolution   : enforce resolution of the 'link' component of a response
+
+    The generator resolves '\$ref' references to external or remote files in the format <file>[#/<reference>] where <file> is either a
+    filename relative to the directory of the primary input file or a url for a remote file. '#/<reference' is a regular local reference.
+    The definitions from the external file should come in one of the predefined sections (definitions, components, links, parameters).
+    If the section is omitted, it defaults to the input file's containing folder (or to 'definitions' if the folder name is not one of
+    the predefined sections).
+    If the external file holds only a single definition, the <reference> in the '\$ref' clause is optional and can be omitted.
+    It defaults to the definition from the file. If the external file holds multiple definitions and the reference is omitted from the
+    '\$ref' clause, the processing run will fail with an error message.
+
+    Example for generating classes from a downloaded swaggerfile and writing them to stdout :
+
+    curl -s -X GET http://openshift-echoservice-dk0429-a.router.default.svc.cluster.local:80/v2/api-docs \|\\
+    swaggercodegen.pl -sb -b ./src/main/java -o 'jsonCardinality|jsonIncludeNonNull|useErrorResponse|generateController|generateControllerAdvice\\
+                                   |generateService|generateClient|extendBaseType|clusterByTag'
+                       -c 'model=controller.model|controller=rest.controller.EchoController|service=rest.client.EchoService'
+                       -p com.db.payment.service.directive.adapter.scgc -i json -
+EOT
+
+    print "${helptext}\n";
 
     exit 0;
 }
@@ -5945,7 +6524,6 @@ sub compileGenerationOptions
     $co->{flags} = {};
     $co->{flags}{dumpswaggerdefinitions}       = 1 if exists $options->{d};
     $co->{flags}{reportonly}                   = 1 if exists $options->{l};
-    $co->{flags}{reportonly}                   = 1 if exists $options->{r};
     $co->{flags}{dumpsymboltable}              = 1 if exists $options->{s};
     $co->{flags}{verbose}                      = 1 if exists $options->{v};
     $co->{flags}{plaindump}                    = 1 if exists $options->{z};
@@ -6025,7 +6603,7 @@ sub checkOption
 
 # parse options
 
-my $optStr  = 'b:c:de:hi:lo:p:rsuvxz';
+my $optStr  = 'b:c:de:hi:lo:p:suvxz';
 my $options = {};
 if (!getopts("$optStr", $options))
 {
@@ -6058,19 +6636,19 @@ if (checkOption($configoptions, 'useErrorResponse'))
 ##
 while (my $infile = shift @ARGV)
 {
-    printf "input  : %s\n", $infile                         if checkOption($configoptions, 'verbose', 'flags');;
+    printf "input  : %s\n", $infile                           if checkOption($configoptions, 'verbose', 'flags');;
 
     $configoptions->{inputfile}   = $infile;
     $configoptions->{outputstate} = !scalar @ARGV;
 
-    my $inputformat = $options->{i}                         if exists $options->{i};
-    $inputformat    = FileInterface::findFormat($infile)    if !defined $inputformat;
-    die "inputformat undefined"                             if !defined $inputformat;
-    die "unsupported inputformat $inputformat"              if !exists $readInput->{$inputformat};
+    my $inputformat     = $options->{i}                       if exists $options->{i};
+    $inputformat        = FileInterface::findFormat($infile)  if !defined $inputformat;
+    die "inputformat undefined"                               if !defined $inputformat;
+    die "unsupported inputformat $inputformat"                if !exists $readInput->{$inputformat};
 
-    $inputhash      = $readInput->{$inputformat}->($infile, $options);
+    $inputhash          = $readInput->{$inputformat}->($infile, $options);
 
-    die "unsupported swagger version $inputhash->{swagger}" if exists $inputhash->{swagger} && $inputhash->{swagger} > swagger_version;
+    die "unsupported swagger version $inputhash->{swagger}"   if exists $inputhash->{swagger} && $inputhash->{swagger} > swagger_version;
 
     $collectedEndpoints = {};
 
